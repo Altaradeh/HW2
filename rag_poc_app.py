@@ -75,8 +75,8 @@ class RAGSystem:
         try:
             # Create directory if it doesn't exist
             os.makedirs(persist_directory, exist_ok=True)
-            
-            self.chroma_client = chromadb.PersistentClient(path=persist_directory)
+
+            self.chroma_client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
             self.collection_name = "manual_chunks"
             
             # Get or create collection
@@ -99,7 +99,7 @@ class RAGSystem:
                     shutil.rmtree(persist_directory)
                 os.makedirs(persist_directory, exist_ok=True)
                 
-                self.chroma_client = chromadb.PersistentClient(path=persist_directory)
+                self.chroma_client = chromadb.Client(Settings(chroma_db_impl="duckdb+parquet", persist_directory=persist_directory))
                 self.collection = self.chroma_client.create_collection(
                     name=self.collection_name,
                     metadata={"hnsw:space": "cosine"}
