@@ -1,51 +1,17 @@
+from dotenv import load_dotenv
+import os
+load_dotenv()
 import openai
+openai.api_key = os.getenv("OPENAI_API_KEY")
 import faiss
 import numpy as np
 import streamlit as st
 import os
 import pickle
-import tempfile
-from dotenv import load_dotenv
 from PyPDF2 import PdfReader
-from typing import List, Dict, Any
-import tiktoken
+from io import BytesIO
 
-# --- Load environment variables ---
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-openai.api_key = OPENAI_API_KEY
-
-# --- Constants ---
-FAISS_INDEX_PATH = "faiss_db/index.faiss"
-FAISS_META_PATH = "faiss_db/meta.pkl"
-CHUNK_SIZE = 512  # tokens
-CHUNK_OVERLAP = 64  # tokens
-
-# --- Utility Functions ---
-
-def ensure_dirs():
-    os.makedirs("faiss_db", exist_ok=True)
-    os.makedirs("logs", exist_ok=True)
-
-def pdf_to_text_chunks(pdf_file, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    reader = PdfReader(pdf_file)
-    all_chunks = []
-    for page_num, page in enumerate(reader.pages):
-        text = page.extract_text() or ""
-        tokens = tiktoken.encoding_for_model("text-embedding-ada-002").encode(text)
-        start = 0
-        while start < len(tokens):
-            end = min(start + chunk_size, len(tokens))
-            chunk_tokens = tokens[start:end]
-            chunk_text = tiktoken.encoding_for_model("text-embedding-ada-002").decode(chunk_tokens)
-            all_chunks.append({
-                "text": chunk_text,
-                "page": page_num + 1,
-                "chunk_id": f"{page_num+1}-{start}-{end}"
-            })
-            start += chunk_size - overlap
-    return all_chunks
-
+# --- Embedding and FAISS setup ---
 def embed_texts(texts, model="text-embedding-3-small"):
     response = openai.embeddings.create(input=texts, model=model)
     return np.array([r.embedding for r in response.data]).astype("float32")
@@ -82,6 +48,28 @@ class FAISSDB:
         faiss.write_index(self.index, self.index_path)
         with open(self.meta_path, "wb") as f:
             pickle.dump(self.meta, f)
+
+    def reset(self):
+        self.index = faiss.IndexFlatL2(self.dim)
+        self.meta = []
+        self.save()
+
+# --- PDF Chunking ---
+def pdf_to_chunks(pdf_file, chunk_size=600, overlap=100):
+    reader = PdfReader(pdf_file)
+    all_chunks = []
+    for page_num, page in enumerate(reader.pages, 1):
+        text = page.extract_text() or ""
+        words = text.split()
+        for i in range(0, len(words), chunk_size - overlap):
+            chunk_words = words[i:i+chunk_size]
+            chunk_text = " ".join(chunk_words)
+            if chunk_text.strip():
+                all_chunks.append({
+                    "text": chunk_text,
+                    "page": page_num
+                })
+    return all_chunks
 
 # --- OpenAI Agent/Assistant setup ---
 def get_or_create_agent():
@@ -120,100 +108,162 @@ def run_agent(agent, user_query, search_fn):
         thread_id=thread.id,
         assistant_id=agent.id
     )
+    import json
     while run.status in ["queued", "in_progress", "requires_action"]:
         if run.status == "requires_action":
+            tool_outputs = []
             for tool_call in run.required_action.submit_tool_outputs.tool_calls:
                 if tool_call.function.name == "search_documents":
                     args = eval(tool_call.function.arguments)
                     results = search_fn(args["query"])
-                    openai.beta.threads.runs.submit_tool_outputs(
-                        thread_id=thread.id,
-                        run_id=run.id,
-                        tool_outputs=[{
-                            "tool_call_id": tool_call.id,
-                            "output": str(results)
-                        }]
-                    )
+                    tool_outputs.append({
+                        "tool_call_id": tool_call.id,
+                        "output": json.dumps(results)
+                    })
+            if tool_outputs:
+                openai.beta.threads.runs.submit_tool_outputs(
+                    thread_id=thread.id,
+                    run_id=run.id,
+                    tool_outputs=tool_outputs
+                )
         run = openai.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id)
     messages = openai.beta.threads.messages.list(thread_id=thread.id, order="desc", limit=1)
-    return messages.data[0].content[0].text.value
+    answer = messages.data[0].content[0].text.value
+    # Fetch the tool output from the run steps
+    tool_output = None
+    try:
+        steps = openai.beta.threads.runs.steps.list(thread_id=thread.id, run_id=run.id)
+        # Debug: print all step details
+        import streamlit as st
+        #st.write("[DEBUG] All run steps:", steps.data)
+        for step in steps.data:
+            # Check for tool_calls step type
+            if hasattr(step, "type") and step.type == "tool_calls":
+                if hasattr(step, "step_details") and hasattr(step.step_details, "tool_calls"):
+                    for tool_call in step.step_details.tool_calls:
+                        if hasattr(tool_call, "output") and tool_call.output:
+                            tool_output = tool_call.output
+    except Exception as e:
+        st.write(f"[DEBUG] Exception while extracting tool output: {e}")
+        tool_output = None
+    return answer, tool_output
 
 # --- Streamlit UI ---
-
-ensure_dirs()
 st.set_page_config(page_title="RAG System with OpenAI Agents & FAISS", layout="wide")
+st.title("📚 RAG System with OpenAI Agents & FAISS")
 
-# --- Example ingestion function to ensure 'text' key is present ---
-def add_documents_to_faiss(db, texts, extra_metadata=None):
-    # extra_metadata: list of dicts or None
-    if extra_metadata is None:
-        metadatas = [{"text": t} for t in texts]
-    else:
-        metadatas = []
-        for t, meta in zip(texts, extra_metadata):
-            m = dict(meta) if meta else {}
-            m["text"] = t
-            metadatas.append(m)
-    db.add(texts, metadatas)
-
-def add_documents_to_faiss(chunks, source):
-    # Assuming this function adds documents to the FAISS index
+# Sidebar: PDF upload and DB controls
+with st.sidebar:
+    st.header("📄 Upload PDF(s)")
+    uploaded_files = st.file_uploader("Upload PDF manuals", type=["pdf"], accept_multiple_files=True)
+    st.markdown("---")
+    st.header("🗄️ Database Controls")
+    reset_pw = st.text_input("Enter password to reset DB", type="password", key="reset_db_pw")
+    if st.button("Reset Database"):
+        if reset_pw == "letmein":  # Change 'letmein' to your desired password
+            db = FAISSDB(dim=1536)
+            db.reset()
+            st.success("Database reset!")
+        else:
+            st.error("Incorrect password. Database not reset.")
+    st.markdown("---")
+    st.header("📊 Stats")
     db = FAISSDB(dim=1536)
-    texts = [chunk["text"] for chunk in chunks]
-    metadatas = [{"source": source, "chunk_id": chunk["chunk_id"]} for chunk in chunks]
-    db.add(texts, metadatas)
+    st.write(f"**Chunks:** {len(db.meta)}")
 
-st.sidebar.title("📚 Document Management")
-uploaded_files = st.sidebar.file_uploader("Upload PDF(s)", type=["pdf"], accept_multiple_files=True)
-if st.sidebar.button("Index Manual(s)") and uploaded_files:
+# Main: Indexing and Query
+if uploaded_files:
+    st.subheader("Indexing PDFs...")
+    db = FAISSDB(dim=1536)
     for file in uploaded_files:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-            tmp.write(file.read())
-            tmp.flush()
-            st.sidebar.write(f"Processing: {file.name}")
-            chunks = pdf_to_text_chunks(tmp.name)
-            add_documents_to_faiss(chunks, file.name)
-    st.sidebar.success("Documents indexed!")
+        with st.spinner(f"Processing {file.name}..."):
+            chunks = pdf_to_chunks(BytesIO(file.read()))
+            texts = []
+            metadatas = []
+            for c in chunks:
+                # Ensure all fields are present and correct
+                text = c.get("text", "")
+                page = c.get("page", "N/A")
+                source = file.name
+                texts.append(text)
+                metadatas.append({"text": text, "page": page, "source": source})
+            db.add(texts, metadatas)
+    st.success("All PDFs indexed!")
+    st.info("If you previously indexed PDFs with missing metadata, please reset the database and re-upload your PDFs for correct chunk display.")
 
-st.sidebar.markdown("---")
-st.sidebar.title("🔎 Database Stats")
+st.header("💬 Ask a Question")
+def on_query_enter():
+    if query.strip():
+        st.session_state["loading"] = True
+        st.session_state["trigger_answer"] = True
+        st.rerun()
 
-def load_faiss_index():
-    db = FAISSDB(dim=1536)
-    return db.index, db.meta
+if "trigger_answer" not in st.session_state:
+    st.session_state["trigger_answer"] = False
 
-index, meta = load_faiss_index()
-def load_faiss_index():
-    db = FAISSDB(dim=1536)
-    return db.index, db.meta
+query = st.text_input(
+    "Enter your question:",
+    key="main_query_input",
+    on_change=on_query_enter
+)
+if "loading" not in st.session_state:
+    st.session_state["loading"] = False
+if "answer" not in st.session_state:
+    st.session_state["answer"] = None
+if "tool_output" not in st.session_state:
+    st.session_state["tool_output"] = None
 
-st.sidebar.write(f"**Documents:** {len(set(m['source'] for m in meta)) if meta else 0}")
-st.sidebar.write(f"**Chunks:** {len(meta) if meta else 0}")
+get_answer_btn = st.button("🔎 Get Answer", disabled=st.session_state["loading"])
+if (get_answer_btn or st.session_state["trigger_answer"]) and query:
+    st.session_state["loading"] = True
+    st.session_state["trigger_answer"] = False
+    st.rerun()
 
-st.title("🤖 RAG System with OpenAI Agents & FAISS")
-st.markdown("Ask questions about your uploaded manuals. The agent will search, analyze, and cite relevant information.")
-
-if "history" not in st.session_state:
-    st.session_state["history"] = []
-
-query = st.text_input("Ask a question about your documents:", key="query")
-search_sensitivity = st.slider("Search Sensitivity (Top K)", 1, 10, 5)
-
-if st.button("Ask") and query:
+if st.session_state["loading"]:
+    import json
     db = FAISSDB(dim=1536)
     agent = get_or_create_agent()
-    def search_fn(q):
-        results = db.search(q, k=5)
-        return "\n".join([r["text"] for r in results])
-    answer = run_agent(agent, query, search_fn)
-    st.write(answer)
+    with st.spinner("Waiting for agent response..."):
+        def search_fn(q):
+            # Return full chunk metadata for JSON serialization (including text and page)
+            results = db.search(q, k=5)
+            # Ensure only serializable fields are included
+            return [
+                {
+                    "text": r.get("text", ""),
+                    "page": r.get("page", "N/A"),
+                    "source": r.get("source", "N/A")
+                }
+                for r in results
+            ]
+        answer, tool_output = run_agent(agent, query, search_fn)
+    st.session_state["answer"] = answer
+    st.session_state["tool_output"] = tool_output
+    st.session_state["loading"] = False
+    st.rerun()
 
-if st.button("Reset Conversation"):
-    st.session_state["history"] = []
-
-st.markdown("### 📝 Conversation History")
-for msg in st.session_state["history"]:
-    if msg["role"] == "user":
-        st.write(f"**User:** {msg['content']}")
-    else:
-        st.write(f"**Agent:** {msg['content']}")
+# Display answer and chunks if available
+if st.session_state["answer"] is not None:
+    st.subheader("🤖 Agent Answer")
+    st.write(st.session_state["answer"])
+    st.markdown("---")
+    st.subheader("🔍 Retrieved Chunks")
+    chunks = []
+    tool_output = st.session_state["tool_output"]
+    if tool_output:
+        import json
+        try:
+            if isinstance(tool_output, list):
+                chunks = tool_output
+            elif isinstance(tool_output, str):
+                chunks = json.loads(tool_output)
+        except Exception as e:
+            st.write(f"[DEBUG] Failed to parse tool output: {e}")
+            chunks = []
+    if not chunks:
+        db = FAISSDB(dim=1536)
+        chunks = db.search(query, k=5)
+    for r in chunks:
+        st.write(f"**Page:** {r.get('page', 'N/A')} | **Source:** {r.get('source','N/A')}")
+        #st.write(r.get('text',''))
+        st.markdown("---")
